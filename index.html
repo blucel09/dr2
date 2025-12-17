@@ -432,6 +432,10 @@
         let selectedDrink = '';
         let selectedTemp = '';
         let audioContext = null;
+        const STORAGE_KEY = 'drinkOrders';
+        const instanceId = (crypto.randomUUID ? crypto.randomUUID() : `instance-${Date.now()}-${Math.random()}`);
+        const syncChannel = 'BroadcastChannel' in window ? new BroadcastChannel('order-sync-channel') : null;
+        let lastSyncSignature = '';
 
         // 오디오 컨텍스트 초기화
         function initAudioContext() {
@@ -511,13 +515,83 @@
         function showNewOrderAlert(customerName) {
             const alert = document.createElement('div');
             alert.className = 'new-order-alert';
-            alert.innerHTML = `🔔 새 주문이 들어왔습니다!<br>${customerName}님의 주문`;
+            alert.innerHTML = `🔔 주문이 들어왔습니다!<br>${customerName}님의 주문`;
             document.body.appendChild(alert);
-            
+
             setTimeout(() => {
                 alert.remove();
             }, 3000);
         }
+
+        // 주문 데이터 저장 및 동기화
+        function saveOrders(shouldBroadcast = true) {
+            lastSyncSignature = JSON.stringify(orders);
+            localStorage.setItem(STORAGE_KEY, lastSyncSignature);
+
+            if (shouldBroadcast && syncChannel) {
+                syncChannel.postMessage({
+                    source: instanceId,
+                    orders
+                });
+            }
+        }
+
+        // 주문 데이터 불러오기
+        function loadOrders() {
+            try {
+                const saved = localStorage.getItem(STORAGE_KEY);
+                if (saved) {
+                    orders = JSON.parse(saved);
+                    lastSyncSignature = saved;
+                }
+            } catch (error) {
+                console.error('주문 데이터를 불러오는 중 오류가 발생했습니다.', error);
+                orders = [];
+            }
+        }
+
+        // 외부 동기화 이벤트 처리 (BroadcastChannel)
+        if (syncChannel) {
+            syncChannel.onmessage = (event) => {
+                const { source, orders: incomingOrders } = event.data || {};
+                if (!incomingOrders || source === instanceId) return;
+
+                const incomingSignature = JSON.stringify(incomingOrders);
+                if (incomingSignature === lastSyncSignature) return;
+
+                const hadOrders = orders.length;
+                orders = incomingOrders;
+                lastSyncSignature = incomingSignature;
+                renderOrderList();
+
+                if (orders.length > hadOrders) {
+                    const latestOrder = orders[orders.length - 1];
+                    showNewOrderAlert(latestOrder.customerName);
+                    playVoiceAlert();
+                }
+            };
+        }
+
+        // localStorage 동기화 (BroadcastChannel 미지원 대비)
+        window.addEventListener('storage', (event) => {
+            if (event.key !== STORAGE_KEY || event.newValue === lastSyncSignature) return;
+
+            try {
+                const newOrders = JSON.parse(event.newValue || '[]');
+                const hadOrders = orders.length;
+                orders = newOrders;
+                lastSyncSignature = event.newValue || '';
+                renderOrderList();
+
+                if (orders.length > hadOrders) {
+                    const latestOrder = orders[orders.length - 1];
+                    showNewOrderAlert(latestOrder.customerName);
+                    playVoiceAlert();
+                }
+            } catch (error) {
+                console.error('동기화 중 오류가 발생했습니다.', error);
+            }
+        });
 
         // 음료 종류 선택
         document.querySelectorAll('.option-btn').forEach(btn => {
@@ -581,37 +655,39 @@
         // 주문 제출
         function submitOrder() {
             const customerName = document.getElementById('customerName').value.trim();
-            
+            const todayKey = new Date().toISOString().split('T')[0];
+
             if (!customerName) {
                 alert('주문자 이름을 입력해주세요.');
                 return;
             }
-            
-            // 같은 이름으로 이미 주문했는지 확인 (상태 관계없이)
-            const existingOrder = orders.find(order => 
-                order.customerName.toLowerCase() === customerName.toLowerCase()
-            );
-            
+
+            // 같은 이름으로 이미 주문했는지 확인 (오늘 기준)
+            const existingOrder = orders.find(order => {
+                const orderDate = order.orderDate || (order.orderTime ? new Date(order.orderTime).toISOString().split('T')[0] : '');
+                return order.customerName.toLowerCase() === customerName.toLowerCase() && orderDate === todayKey;
+            });
+
             if (existingOrder) {
-                alert(`${customerName}님은 이미 주문하셨습니다.\n한 사람당 하나의 주문만 가능합니다.`);
+                alert('죄송합니다 하루에 한잔만 주문가능합니다.');
                 return;
             }
-            
+
             if (!selectedDrinkType) {
                 alert('음료 종류를 선택해주세요.');
                 return;
             }
-            
+
             if (!selectedDrink) {
                 alert('음료를 선택해주세요.');
                 return;
             }
-            
+
             if (selectedDrinkType === 'coffee' && !selectedTemp) {
                 alert('온도를 선택해주세요.');
                 return;
             }
-            
+
             // 주문 생성
             const order = {
                 id: Date.now(),
@@ -620,20 +696,22 @@
                 drink: selectedDrink,
                 temperature: selectedTemp,
                 status: '주문접수',
+                orderDate: todayKey,
                 orderTime: new Date().toLocaleString('ko-KR')
             };
-            
+
             orders.push(order);
-            
+            saveOrders();
+
             // 딩동 소리와 음성 안내 재생
             playVoiceAlert();
-            
+
             // 새 주문 알림 표시
             showNewOrderAlert(customerName);
-            
+
             // 주문 목록 즉시 업데이트
             renderOrderList();
-            
+
             // 폼 초기화
             document.getElementById('customerName').value = '';
             selectedDrinkType = '';
@@ -644,7 +722,7 @@
             document.querySelectorAll('.temp-btn').forEach(b => b.classList.remove('active'));
             document.getElementById('coffee-options').classList.add('hidden');
             document.getElementById('ade-options').classList.add('hidden');
-            
+
             alert('주문이 완료되었습니다!');
         }
 
@@ -741,6 +819,7 @@
                     break;
             }
             
+            saveOrders();
             renderOrderList();
         }
 
@@ -749,6 +828,12 @@
             initAudioContext();
             document.removeEventListener('click', initAudio);
         }, { once: true });
+
+        // 페이지 초기화
+        document.addEventListener('DOMContentLoaded', () => {
+            loadOrders();
+            renderOrderList();
+        });
     </script>
 </body>
 </html>
